@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: volkov-concurs-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_USERNAME
+        value: wwtivan
