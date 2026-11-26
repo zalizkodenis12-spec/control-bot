@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
 import sys
 from typing import Any
@@ -1248,6 +1249,26 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Start lightweight healthcheck HTTP server when PORT is set (Render, Railway, Koyeb, etc.)
+    port_str = os.getenv("PORT")
+    if port_str:
+        try:
+            from aiohttp import web
+
+            async def handle_health(request: Any) -> web.Response:
+                return web.Response(text="Bot is running 24/7!", status=200)
+
+            app = web.Application()
+            app.router.add_get("/", handle_health)
+            app.router.add_get("/health", handle_health)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", int(port_str))
+            await site.start()
+            logger.info("Healthcheck HTTP сервер запущен на порту %s", port_str)
+        except Exception as exc:
+            logger.warning("Не удалось запустить healthcheck HTTP сервер: %s", exc)
 
     logger.info("Запуск polling... Нажмите Ctrl+C для остановки.")
     try:
