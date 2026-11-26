@@ -24,7 +24,7 @@ def _get_connection(db_path: str = DB_PATH) -> Iterator[sqlite3.Connection]:
 
 
 def init_db(db_path: str = DB_PATH) -> None:
-    """Initialize SQLite tables for contest state, participants, and single-admin username binding."""
+    """Initialize SQLite tables for contest state, participants, reserved spots, and single-admin username binding."""
     with _db_lock, _get_connection(db_path) as conn:
         with conn:
             conn.execute(
@@ -46,6 +46,16 @@ def init_db(db_path: str = DB_PATH) -> None:
                     last_name TEXT,
                     username TEXT,
                     joined_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reserved_spots (
+                    number INTEGER PRIMARY KEY,
+                    full_name TEXT NOT NULL,
+                    username TEXT,
+                    reserved_at TEXT NOT NULL
                 )
                 """
             )
@@ -169,7 +179,8 @@ def register_participant(
     Register a participant in the active contest.
     - Returns (is_new, number).
     - If user_id already exists, updates first_name, last_name, username and returns (False, existing_number).
-    - If new, assigns next_number = max(number) + 1 (starting from 1) atomically and returns (True, number).
+    - If new, assigns next_number starting from max(participants.number, default=0) + 1,
+      skipping any numbers present in reserved_spots (or participants), atomically and returns (True, number).
     """
     init_db(db_path)
     if username:
@@ -204,20 +215,128 @@ def register_participant(
             max_row = conn.execute(
                 "SELECT COALESCE(MAX(number), 0) AS max_num FROM participants"
             ).fetchone()
-            next_number = int(max_row["max_num"]) + 1
+            candidate = int(max_row["max_num"]) + 1
+
+            while True:
+                taken_in_reserved = conn.execute(
+                    "SELECT 1 FROM reserved_spots WHERE number = ?",
+                    (candidate,),
+                ).fetchone()
+                taken_in_participants = conn.execute(
+                    "SELECT 1 FROM participants WHERE number = ?",
+                    (candidate,),
+                ).fetchone()
+                if taken_in_reserved is None and taken_in_participants is None:
+                    break
+                candidate += 1
 
             conn.execute(
                 """
                 INSERT INTO participants (number, user_id, first_name, last_name, username, joined_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (next_number, int(user_id), clean_first, clean_last, clean_uname, now_iso),
+                (candidate, int(user_id), clean_first, clean_last, clean_uname, now_iso),
             )
             conn.execute("COMMIT")
-            return True, next_number
+            return True, candidate
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+
+def reserve_spot(
+    number: int,
+    full_name: str,
+    username: str | None = None,
+    db_path: str = DB_PATH,
+) -> tuple[bool, str]:
+    """
+    Reserve a specific participant number for a pre-assigned person.
+    Returns (success, message).
+    - Fails if number < 1 or if number is already taken by a real participant in `participants`.
+    - Overwrites existing reservation if the number was already reserved.
+    """
+    try:
+        num = int(number)
+    except (ValueError, TypeError):
+        return False, "Номер места должен быть целым числом больше 0!"
+
+    if num < 1:
+        return False, "Номер места должен быть больше или равен 1!"
+
+    init_db(db_path)
+    clean_name = (full_name or "").strip() or "Участник"
+    clean_uname = _clean_username(username)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with _db_lock, _get_connection(db_path) as conn:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            taken = conn.execute(
+                "SELECT 1 FROM participants WHERE number = ?",
+                (num,),
+            ).fetchone()
+            if taken is not None:
+                conn.execute("ROLLBACK")
+                return False, f"Место №{num} уже занято реальным участником!"
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO reserved_spots (number, full_name, username, reserved_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (num, clean_name, clean_uname, now_iso),
+            )
+            conn.execute("COMMIT")
+            return True, f"Место №{num} забронировано!"
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def unreserve_spot(number: int, db_path: str = DB_PATH) -> bool:
+    """Remove a reservation by number. Returns True if a reservation was removed, False otherwise."""
+    try:
+        num = int(number)
+    except (ValueError, TypeError):
+        return False
+
+    init_db(db_path)
+    with _db_lock, _get_connection(db_path) as conn:
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM reserved_spots WHERE number = ?",
+                (num,),
+            )
+            return (cur.rowcount or 0) > 0
+
+
+def get_reserved_spots(db_path: str = DB_PATH) -> list[dict[str, Any]]:
+    """Return all reserved spots ordered by number ASC."""
+    init_db(db_path)
+    with _db_lock, _get_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT number, full_name, username, reserved_at
+            FROM reserved_spots
+            ORDER BY number ASC
+            """
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["is_reserved"] = True
+            result.append(d)
+        return result
+
+
+def clear_reserved_spots(db_path: str = DB_PATH) -> None:
+    """Delete all reserved spots."""
+    init_db(db_path)
+    with _db_lock, _get_connection(db_path) as conn:
+        with conn:
+            conn.execute("DELETE FROM reserved_spots")
 
 
 def get_participant(user_id: int, db_path: str = DB_PATH) -> dict[str, Any] | None:
@@ -235,35 +354,81 @@ def get_participant(user_id: int, db_path: str = DB_PATH) -> dict[str, Any] | No
         return dict(row) if row is not None else None
 
 
-def get_all_participants(db_path: str = DB_PATH) -> list[dict[str, Any]]:
-    """Return all participants ordered by number ASC (1..N)."""
+def get_all_participants(
+    db_path: str = DB_PATH,
+    include_reserved: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    Return all participants ordered by number ASC.
+    When include_reserved=True (default), merges real participants (is_reserved=False)
+    and reserved_spots (first_name=full_name, last_name=None, is_reserved=True) sorted by number ASC.
+    """
     init_db(db_path)
     with _db_lock, _get_connection(db_path) as conn:
-        rows = conn.execute(
+        p_rows = conn.execute(
             """
             SELECT number, user_id, first_name, last_name, username, joined_at
             FROM participants
             ORDER BY number ASC
             """
         ).fetchall()
-        return [dict(r) for r in rows]
+
+        items: list[dict[str, Any]] = []
+        for r in p_rows:
+            d = dict(r)
+            d["is_reserved"] = False
+            items.append(d)
+
+        if include_reserved:
+            r_rows = conn.execute(
+                """
+                SELECT number, full_name, username, reserved_at
+                FROM reserved_spots
+                ORDER BY number ASC
+                """
+            ).fetchall()
+            for r in r_rows:
+                items.append(
+                    {
+                        "number": int(r["number"]),
+                        "user_id": None,
+                        "first_name": r["full_name"],
+                        "last_name": None,
+                        "full_name": r["full_name"],
+                        "username": r["username"],
+                        "joined_at": r["reserved_at"],
+                        "reserved_at": r["reserved_at"],
+                        "is_reserved": True,
+                    }
+                )
+            items.sort(key=lambda x: int(x["number"]))
+
+        return items
 
 
-def get_participants_count(db_path: str = DB_PATH) -> int:
-    """Return total number of registered participants."""
+def get_participants_count(
+    db_path: str = DB_PATH,
+    include_reserved: bool = True,
+) -> int:
+    """Return total number of participants (including reserved spots when include_reserved=True)."""
     init_db(db_path)
     with _db_lock, _get_connection(db_path) as conn:
-        row = conn.execute("SELECT COUNT(*) AS cnt FROM participants").fetchone()
-        return int(row["cnt"]) if row is not None else 0
+        p_row = conn.execute("SELECT COUNT(*) AS cnt FROM participants").fetchone()
+        total = int(p_row["cnt"]) if p_row is not None else 0
+        if include_reserved:
+            r_row = conn.execute("SELECT COUNT(*) AS cnt FROM reserved_spots").fetchone()
+            total += int(r_row["cnt"]) if r_row is not None else 0
+        return total
 
 
 def reset_contest(db_path: str = DB_PATH) -> None:
-    """Clear all participants and activate a new contest starting from number 1."""
+    """Clear all participants and reserved spots, and activate a new contest starting from number 1."""
     init_db(db_path)
     now_iso = datetime.now(timezone.utc).isoformat()
     with _db_lock, _get_connection(db_path) as conn:
         with conn:
             conn.execute("DELETE FROM participants")
+            conn.execute("DELETE FROM reserved_spots")
             conn.execute(
                 """
                 UPDATE contest_state
@@ -278,7 +443,8 @@ def reset_contest(db_path: str = DB_PATH) -> None:
 
 def format_participant_line(p: dict[str, Any], include_number: bool = True) -> str:
     """
-    Format a participant dict as an HTML line with HTML-escaped name and spoiler-wrapped @username.
+    Format a participant or reserved spot dict as an HTML line with HTML-escaped name
+    and spoiler-wrapped @username.
     - If username exists: <tg-spoiler>@username_value</tg-spoiler>
     - If username is None/empty: <tg-spoiler>@username</tg-spoiler>
     - With include_number=True: "{number}. {full_name} <tg-spoiler>@{uname}</tg-spoiler>"
@@ -286,7 +452,10 @@ def format_participant_line(p: dict[str, Any], include_number: bool = True) -> s
     """
     first_raw = (p.get("first_name") or "").strip()
     last_raw = (p.get("last_name") or "").strip()
-    full_name_raw = f"{first_raw} {last_raw}".strip() or "Участник"
+    if first_raw or last_raw:
+        full_name_raw = f"{first_raw} {last_raw}".strip()
+    else:
+        full_name_raw = (p.get("full_name") or "").strip() or "Участник"
     full_name = html.escape(full_name_raw)
 
     raw_uname = _clean_username(p.get("username"))
@@ -336,14 +505,36 @@ class Database:
             db_path=self.db_path,
         )
 
+    def reserve_spot(
+        self,
+        number: int,
+        full_name: str,
+        username: str | None = None,
+    ) -> tuple[bool, str]:
+        return reserve_spot(
+            number=number,
+            full_name=full_name,
+            username=username,
+            db_path=self.db_path,
+        )
+
+    def unreserve_spot(self, number: int) -> bool:
+        return unreserve_spot(number=number, db_path=self.db_path)
+
+    def get_reserved_spots(self) -> list[dict[str, Any]]:
+        return get_reserved_spots(db_path=self.db_path)
+
+    def clear_reserved_spots(self) -> None:
+        clear_reserved_spots(db_path=self.db_path)
+
     def get_participant(self, user_id: int) -> dict[str, Any] | None:
         return get_participant(user_id, self.db_path)
 
-    def get_all_participants(self) -> list[dict[str, Any]]:
-        return get_all_participants(self.db_path)
+    def get_all_participants(self, include_reserved: bool = True) -> list[dict[str, Any]]:
+        return get_all_participants(self.db_path, include_reserved=include_reserved)
 
-    def get_participants_count(self) -> int:
-        return get_participants_count(self.db_path)
+    def get_participants_count(self, include_reserved: bool = True) -> int:
+        return get_participants_count(self.db_path, include_reserved=include_reserved)
 
     def reset_contest(self) -> None:
         reset_contest(self.db_path)

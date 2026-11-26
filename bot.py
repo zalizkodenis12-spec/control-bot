@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-import os
+import re
 import sys
 from typing import Any
 
@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 3800
 
 router = Router(name="contest_router")
+
+_RESERVE_LINE_RE = re.compile(
+    r"^\s*(?:№|#)?\s*(\d+)\s*[\.\-\—\:]?\s+(.+?)\s*$"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +69,10 @@ def get_participant_reply_keyboard(is_user_admin: bool = False) -> ReplyKeyboard
 def get_admin_inline_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
     """Inline keyboard for the Author/Admin Panel."""
     count = database.get_participants_count(db_path=db_path)
+    reserved_count = len(database.get_reserved_spots(db_path=db_path))
+    reserve_btn_text = (
+        f"📌 Бронь мест ({reserved_count})" if reserved_count > 0 else "📌 Бронь мест"
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -77,6 +85,12 @@ def get_admin_inline_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=f"📋 Список участников ({count})",
                     callback_data="admin_list",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=reserve_btn_text,
+                    callback_data="admin_reserve",
                 )
             ],
             [
@@ -99,6 +113,44 @@ def get_admin_inline_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def get_admin_reserve_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
+    """Inline keyboard for managing reserved/booked participant numbers."""
+    reserved = database.get_reserved_spots(db_path=db_path)
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for item in reserved[:15]:
+        num = item["number"]
+        name_preview = (item.get("full_name") or "Участник")[:20]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"❌ Снять бронь №{num} ({name_preview})",
+                    callback_data=f"admin_unreserve:{num}",
+                )
+            ]
+        )
+
+    if reserved:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🗑 Очистить всю бронь",
+                    callback_data="admin_clear_reserves",
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Назад в панель",
+                callback_data="admin_panel",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_admin_reset_confirm_keyboard() -> InlineKeyboardMarkup:
@@ -140,6 +192,205 @@ def get_channel_post_keyboard(bot_username: str) -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 # Pure Helpers & Business Logic (Unit-Testable without Network)
 # ---------------------------------------------------------------------------
+
+
+def parse_reservation_line(line: str) -> tuple[int, str, str | None] | None:
+    """
+    Parse a single reservation line into (number, full_name, username).
+    Accepted formats:
+      - "55 Иван Иванов @ivan" -> (55, "Иван Иванов", "ivan")
+      - "№55 Иван Иванов @ivan" / "55. Иван Иванов @ivan" -> (55, "Иван Иванов", "ivan")
+      - "55 Иван Иванов" -> (55, "Иван Иванов", None)
+      - "55 @ivan" -> (55, "Участник", "ivan")
+    Returns None if the line does not match a valid reservation pattern.
+    """
+    if not line or not line.strip():
+        return None
+
+    cleaned = line.strip()
+    for prefix in ("/reserve", "/book", "бронь"):
+        if cleaned.lower().startswith(prefix):
+            cleaned = cleaned[len(prefix) :].strip()
+            break
+
+    match = _RESERVE_LINE_RE.match(cleaned)
+    if not match:
+        return None
+
+    try:
+        number = int(match.group(1))
+    except ValueError:
+        return None
+
+    if number < 1:
+        return None
+
+    rest = match.group(2).strip()
+    if not rest:
+        return None
+
+    tokens = rest.split()
+    username: str | None = None
+    name_tokens: list[str] = []
+
+    for idx, tok in enumerate(tokens):
+        if tok.startswith("@") and len(tok) > 1 and idx == len(tokens) - 1:
+            username = tok.lstrip("@").strip() or None
+        else:
+            name_tokens.append(tok)
+
+    full_name = " ".join(name_tokens).strip()
+    if not full_name:
+        if username:
+            full_name = "Участник"
+        else:
+            return None
+
+    return number, full_name, username
+
+
+def is_direct_reservation_message(text: str | None) -> bool:
+    """
+    Return True if a plain text message consists of one or more valid reservation lines
+    (e.g. "55 Иван Иванов @ivan").
+    """
+    if not text or not text.strip():
+        return False
+    stripped = text.strip()
+    if stripped.startswith("/"):
+        return False
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    return all(parse_reservation_line(ln) is not None for ln in lines)
+
+
+def handle_reserve_command(
+    raw_text: str | None,
+    db_path: str = DB_PATH,
+) -> tuple[bool, str]:
+    """
+    Process one or more reservation lines from admin input (via /reserve or direct message).
+    Returns (all_succeeded, html_message).
+    """
+    if not raw_text or not raw_text.strip():
+        return (
+            False,
+            "⚠️ <b>Укажите номер места, имя и (по желанию) @username.</b>\n\n"
+            "Примеры:\n"
+            "<code>55 Иван Иванов @ivan</code>\n"
+            "<code>/reserve 55 Иван Иванов @ivan</code>",
+        )
+
+    cleaned = raw_text.strip()
+    for prefix in ("/reserve", "/book"):
+        if cleaned.lower().startswith(prefix):
+            cleaned = cleaned[len(prefix) :].strip()
+            break
+
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    if not lines:
+        return (
+            False,
+            "⚠️ <b>Укажите номер места, имя и (по желанию) @username.</b>\n\n"
+            "Пример: <code>55 Иван Иванов @ivan</code>",
+        )
+
+    results: list[str] = []
+    all_ok = True
+
+    for ln in lines:
+        parsed = parse_reservation_line(ln)
+        if parsed is None:
+            all_ok = False
+            results.append(
+                f"❌ Не удалось распознать строку: <code>{html.escape(ln)}</code>\n"
+                "Формат: <code>НОМЕР Имя Фамилия @username</code>"
+            )
+            continue
+
+        number, full_name, username = parsed
+        ok, msg = database.reserve_spot(
+            number=number,
+            full_name=full_name,
+            username=username,
+            db_path=db_path,
+        )
+        if ok:
+            formatted = database.format_participant_line(
+                {
+                    "number": number,
+                    "full_name": full_name,
+                    "username": username,
+                },
+                include_number=True,
+            )
+            results.append(f"✅ Забронировано: <b>№{number}</b> — {formatted}")
+        else:
+            all_ok = False
+            results.append(f"⛔ {html.escape(msg)}")
+
+    return all_ok, "\n".join(results)
+
+
+def handle_unreserve_command(
+    raw_text: str | None,
+    db_path: str = DB_PATH,
+) -> tuple[bool, str]:
+    """
+    Remove a reservation by number (from /unreserve <number>).
+    Returns (succeeded, html_message).
+    """
+    if not raw_text or not raw_text.strip():
+        return (
+            False,
+            "⚠️ Укажите номер места для снятия брони, например: <code>/unreserve 55</code>",
+        )
+
+    cleaned = raw_text.strip()
+    for prefix in ("/unreserve", "/unbook"):
+        if cleaned.lower().startswith(prefix):
+            cleaned = cleaned[len(prefix) :].strip()
+            break
+
+    cleaned = cleaned.lstrip("№#").strip()
+    try:
+        number = int(cleaned)
+    except ValueError:
+        return (
+            False,
+            "⚠️ Номер места должен быть числом, например: <code>/unreserve 55</code>",
+        )
+
+    removed = database.unreserve_spot(number=number, db_path=db_path)
+    if removed:
+        return True, f"✅ Бронь с места <b>№{number}</b> успешно снята."
+    return False, f"ℹ️ Место <b>№{number}</b> не числится в списке забронированных."
+
+
+def build_reserved_spots_text(db_path: str = DB_PATH) -> str:
+    """Build the Admin Panel view for managing reserved/booked participant numbers."""
+    reserved = database.get_reserved_spots(db_path=db_path)
+    if not reserved:
+        list_part = "<i>Сейчас нет забронированных мест.</i>"
+    else:
+        lines = [
+            database.format_participant_line(item, include_number=True)
+            for item in reserved
+        ]
+        list_part = "\n".join(lines)
+
+    return (
+        "📌 <b>Бронирование мест (предварительная запись)</b>\n\n"
+        "Забронированные номера автоматически пропускаются при нажатии кнопки "
+        "«🎉 Участвовать» обычными участниками, а в итоговом списке стоят ровно на своих местах.\n\n"
+        f"📋 <b>Текущая бронь ({len(reserved)}):</b>\n"
+        f"{list_part}\n\n"
+        "➕ <b>Как забронировать место:</b>\n"
+        "Просто отправьте сюда сообщение в формате:\n"
+        "<code>55 Иван Иванов @ivan</code>\n"
+        "<i>(можно отправить сразу несколько строк или без @username: <code>55 Иван Иванов</code>)</i>"
+    )
 
 
 def format_new_participant_admin_notification(
@@ -207,11 +458,11 @@ def build_participants_list_messages(
     max_length: int = MAX_MESSAGE_LENGTH,
 ) -> list[str]:
     """
-    Build the HTML message(s) showing all participants from 1 to N.
+    Build the HTML message(s) showing all participants (including reserved spots) ordered by number.
     - If finished=True: formats the final contest completion list.
     - If finished=False: formats the current participant list with contest status.
     """
-    participants = database.get_all_participants(db_path=db_path)
+    participants = database.get_all_participants(db_path=db_path, include_reserved=True)
     count = len(participants)
 
     if finished:
@@ -244,7 +495,7 @@ def finish_contest_and_get_messages(
 ) -> list[str]:
     """
     Mark the contest as finished (is_active=False) and return the chunked
-    numbered list of all participants from 1 to last.
+    numbered list of all participants from 1 to last (including reserved spots).
     """
     database.set_contest_active(False, db_path=db_path)
     return build_participants_list_messages(
@@ -263,6 +514,7 @@ def handle_participation(
 ) -> dict[str, Any]:
     """
     Process a user's request to participate in the contest.
+    Automatically skips any numbers reserved in `reserved_spots`.
     Returns a dict with:
       - active (bool)
       - is_new (bool)
@@ -344,11 +596,16 @@ def get_admin_panel_text(db_path: str = DB_PATH) -> str:
     """Build the status overview text for the Author/Admin Panel."""
     active = database.is_contest_active(db_path=db_path)
     count = database.get_participants_count(db_path=db_path)
+    reserved_count = len(database.get_reserved_spots(db_path=db_path))
     status_str = "🟢 Активен (идёт набор участников)" if active else "🔴 Завершён"
+    reserved_line = (
+        f"📌 Забронировано мест: <b>{reserved_count}</b>\n" if reserved_count > 0 else ""
+    )
     return (
         "⚙️ <b>Панель управления конкурсом (Автор)</b>\n\n"
         f"📊 Статус конкурса: <b>{status_str}</b>\n"
-        f"👥 Зарегистрировано участников: <b>{count}</b>\n\n"
+        f"👥 Всего участников в списке: <b>{count}</b>\n"
+        f"{reserved_line}\n"
         "Выберите нужное действие кнопками ниже:"
     )
 
@@ -386,13 +643,17 @@ async def cmd_start(
     """
     Handle /start and /start contest.
     - Shows the Russian welcome message with the '🎉 Участвовать' button (both reply and inline).
-    - Strictly ONLY if the user is the configured ADMIN_ID, also displays the Admin Panel controls.
+    - Strictly ONLY if the user is the configured admin, also displays the Admin Panel controls.
     """
     user = message.from_user
     if user is None:
         return
 
-    user_is_admin = database.is_admin(user.id, username=getattr(user, "username", None), db_path=db_path)
+    user_is_admin = database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    )
     welcome_text = get_welcome_text(user.first_name, db_path=db_path)
 
     await message.answer(
@@ -436,11 +697,15 @@ async def cmd_admin(
 ) -> None:
     """
     Handle /admin.
-    Strictly only responds if user.id == config.ADMIN_ID.
+    Strictly only responds if the user is the configured admin.
     If not admin, silently ignores the command (no reply, error, or hint).
     """
     user = message.from_user
-    if user is None or not database.is_admin(user.id, username=getattr(user, "username", None), db_path=db_path):
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
         return
 
     await message.answer(
@@ -450,14 +715,90 @@ async def cmd_admin(
     )
 
 
+@router.message(Command("reserve", "book"))
+async def cmd_reserve(
+    message: Message,
+    command: CommandObject | None = None,
+    db_path: str = DB_PATH,
+) -> None:
+    """
+    Handle /reserve <number> <Name> [@username] (or /book).
+    Strictly admin-only; silently ignored for non-admins.
+    """
+    user = message.from_user
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
+        return
+
+    args = command.args if command is not None else None
+    if args is None and message.text:
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) > 1:
+            args = parts[1]
+
+    if not args or not args.strip():
+        await message.answer(
+            build_reserved_spots_text(db_path=db_path),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_reserve_keyboard(db_path=db_path),
+        )
+        return
+
+    _, response_html = handle_reserve_command(args, db_path=db_path)
+    await message.answer(
+        f"{response_html}\n\n{build_reserved_spots_text(db_path=db_path)}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_reserve_keyboard(db_path=db_path),
+    )
+
+
+@router.message(Command("unreserve", "unbook"))
+async def cmd_unreserve(
+    message: Message,
+    command: CommandObject | None = None,
+    db_path: str = DB_PATH,
+) -> None:
+    """
+    Handle /unreserve <number> (or /unbook <number>).
+    Strictly admin-only; silently ignored for non-admins.
+    """
+    user = message.from_user
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
+        return
+
+    args = command.args if command is not None else None
+    if args is None and message.text:
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) > 1:
+            args = parts[1]
+
+    _, response_html = handle_unreserve_command(args, db_path=db_path)
+    await message.answer(
+        f"{response_html}\n\n{build_reserved_spots_text(db_path=db_path)}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_reserve_keyboard(db_path=db_path),
+    )
+
+
 @router.message(F.text.in_({"⚙️ Админ-панель", "Админ-панель"}))
 async def on_admin_panel_text(message: Message, db_path: str = DB_PATH) -> None:
     """
     Open Admin Panel from the reply keyboard button.
-    Strictly only responds if user.id == config.ADMIN_ID; silently ignores non-admins.
+    Strictly only responds if the user is the configured admin; silently ignores non-admins.
     """
     user = message.from_user
-    if user is None or not database.is_admin(user.id, username=getattr(user, "username", None), db_path=db_path):
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
         return
 
     await message.answer(
@@ -493,6 +834,32 @@ async def on_participate_text(message: Message, db_path: str = DB_PATH) -> None:
             admin_ids=result["admin_ids"],
             notification_text=result["admin_notification"],
         )
+
+
+@router.message(F.text.func(is_direct_reservation_message))
+async def on_admin_direct_reservation_text(
+    message: Message,
+    db_path: str = DB_PATH,
+) -> None:
+    """
+    Allow the admin to book spot(s) by simply sending a message like:
+      55 Иван Иванов @ivan
+    Silently ignored if sender is not the admin.
+    """
+    user = message.from_user
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
+        return
+
+    _, response_html = handle_reserve_command(message.text, db_path=db_path)
+    await message.answer(
+        f"{response_html}\n\n{build_reserved_spots_text(db_path=db_path)}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_reserve_keyboard(db_path=db_path),
+    )
 
 
 @router.callback_query(F.data == "participate")
@@ -541,7 +908,11 @@ async def on_admin_panel_callback(
 ) -> None:
     """Return to the main Admin Panel view. Silently ignored for non-admins."""
     user = callback.from_user
-    if user is None or not database.is_admin(user.id, username=getattr(user, "username", None), db_path=db_path):
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
         await callback.answer()
         return
 
@@ -552,6 +923,83 @@ async def on_admin_panel_callback(
             reply_markup=get_admin_inline_keyboard(db_path=db_path),
         )
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin_reserve")
+async def on_admin_reserve_callback(
+    callback: CallbackQuery,
+    db_path: str = DB_PATH,
+) -> None:
+    """Open the Reserved / Booked Spots management menu. Silently ignored for non-admins."""
+    user = callback.from_user
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
+        await callback.answer()
+        return
+
+    if callback.message is not None:
+        await callback.message.answer(
+            build_reserved_spots_text(db_path=db_path),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_reserve_keyboard(db_path=db_path),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_unreserve:"))
+async def on_admin_unreserve_callback(
+    callback: CallbackQuery,
+    db_path: str = DB_PATH,
+) -> None:
+    """Remove a single reserved spot via inline button. Silently ignored for non-admins."""
+    user = callback.from_user
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
+        await callback.answer()
+        return
+
+    raw_num = (callback.data or "").split(":", 1)[-1].strip()
+    _, response_html = handle_unreserve_command(raw_num, db_path=db_path)
+
+    if callback.message is not None:
+        await callback.message.answer(
+            f"{response_html}\n\n{build_reserved_spots_text(db_path=db_path)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_reserve_keyboard(db_path=db_path),
+        )
+    await callback.answer("✅ Бронь снята")
+
+
+@router.callback_query(F.data == "admin_clear_reserves")
+async def on_admin_clear_reserves_callback(
+    callback: CallbackQuery,
+    db_path: str = DB_PATH,
+) -> None:
+    """Clear all reserved spots. Silently ignored for non-admins."""
+    user = callback.from_user
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
+        await callback.answer()
+        return
+
+    database.clear_reserved_spots(db_path=db_path)
+
+    if callback.message is not None:
+        await callback.message.answer(
+            f"🗑 <b>Все забронированные места очищены.</b>\n\n{build_reserved_spots_text(db_path=db_path)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_reserve_keyboard(db_path=db_path),
+        )
+    await callback.answer("🗑 Бронь очищена")
 
 
 @router.callback_query(F.data == "admin_finish")
@@ -567,7 +1015,11 @@ async def on_admin_finish_callback(
     - Silently ignored for non-admins.
     """
     user = callback.from_user
-    if user is None or not database.is_admin(user.id, username=getattr(user, "username", None), db_path=db_path):
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
         await callback.answer()
         return
 
@@ -596,7 +1048,11 @@ async def on_admin_list_callback(
     - Silently ignored for non-admins.
     """
     user = callback.from_user
-    if user is None or not database.is_admin(user.id, username=getattr(user, "username", None), db_path=db_path):
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
         await callback.answer()
         return
 
@@ -621,7 +1077,11 @@ async def on_admin_reset_callback(
 ) -> None:
     """Ask confirmation before resetting the contest and clearing participants. Silently ignored for non-admins."""
     user = callback.from_user
-    if user is None or not database.is_admin(user.id, username=getattr(user, "username", None), db_path=db_path):
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
         await callback.answer()
         return
 
@@ -629,8 +1089,8 @@ async def on_admin_reset_callback(
     if callback.message is not None:
         await callback.message.answer(
             "⚠️ <b>Подтверждение сброса конкурса</b>\n\n"
-            f"Сейчас в списке <b>{count}</b> участник(ов).\n"
-            "Вы уверены, что хотите очистить текущий список и запустить новый конкурс с №1?",
+            f"Сейчас в списке <b>{count}</b> участник(ов) (включая бронь).\n"
+            "Вы уверены, что хотите очистить текущий список (и бронь) и запустить новый конкурс с №1?",
             parse_mode=ParseMode.HTML,
             reply_markup=get_admin_reset_confirm_keyboard(),
         )
@@ -642,9 +1102,13 @@ async def on_admin_reset_confirm_callback(
     callback: CallbackQuery,
     db_path: str = DB_PATH,
 ) -> None:
-    """Confirm resetting the contest: clears participants and sets active=True. Silently ignored for non-admins."""
+    """Confirm resetting the contest: clears participants and reserved spots and sets active=True. Silently ignored for non-admins."""
     user = callback.from_user
-    if user is None or not database.is_admin(user.id, username=getattr(user, "username", None), db_path=db_path):
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
         await callback.answer()
         return
 
@@ -653,7 +1117,7 @@ async def on_admin_reset_confirm_callback(
     if callback.message is not None:
         await callback.message.answer(
             "🔄 <b>Новый конкурс успешно запущен!</b>\n\n"
-            "Список участников очищен. Нумерация новых участников начинается с <b>№1</b>.",
+            "Список участников и бронь очищены. Нумерация новых участников начинается с <b>№1</b>.",
             parse_mode=ParseMode.HTML,
             reply_markup=get_admin_inline_keyboard(db_path=db_path),
         )
@@ -670,7 +1134,11 @@ async def on_admin_post_callback(
     with an inline URL button 'Участвовать'. Silently ignored for non-admins.
     """
     user = callback.from_user
-    if user is None or not database.is_admin(user.id, username=getattr(user, "username", None), db_path=db_path):
+    if user is None or not database.is_admin(
+        user.id,
+        username=getattr(user, "username", None),
+        db_path=db_path,
+    ):
         await callback.answer()
         return
 
@@ -780,25 +1248,6 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.include_router(router)
-
-    # If running in cloud hosting (Render, Railway, Koyeb, etc.), start a lightweight healthcheck HTTP server
-    port_str = os.getenv("PORT")
-    if port_str:
-        try:
-            from aiohttp import web
-            async def handle_health(request):
-                return web.Response(text="Bot is running 24/7!", status=200)
-
-            app = web.Application()
-            app.router.add_get("/", handle_health)
-            app.router.add_get("/health", handle_health)
-            runner = web.AppRunner(app)
-            await runner.setup()
-            site = web.TCPSite(runner, "0.0.0.0", int(port_str))
-            await site.start()
-            logger.info("Healthcheck HTTP сервер запущен на порту %s", port_str)
-        except Exception as e:
-            logger.warning("Не удалось запустить healthcheck HTTP сервер: %s", e)
 
     logger.info("Запуск polling... Нажмите Ctrl+C для остановки.")
     try:

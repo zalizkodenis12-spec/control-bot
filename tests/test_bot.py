@@ -239,7 +239,99 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_first["number"], 1)
 
     # -----------------------------------------------------------------------
-    # 7. Strict Single-Admin (ADMIN_USERNAME=wwtivan / ADMIN_ID) & Silent Ignore
+    # 7. Reserved / Booked Spots (Skipping 1 & 55 -> 56, Parsing, Admin-Only)
+    # -----------------------------------------------------------------------
+    async def test_reserved_spots_skipping_55_to_56_and_admin_only(self) -> None:
+        # Verify parse_reservation_line formats
+        self.assertEqual(
+            bot.parse_reservation_line("55 Иван Иванов @ivan"),
+            (55, "Иван Иванов", "ivan"),
+        )
+        self.assertEqual(
+            bot.parse_reservation_line("№55 Иван Иванов"),
+            (55, "Иван Иванов", None),
+        )
+        self.assertEqual(
+            bot.parse_reservation_line("55 @ivan"),
+            (55, "Участник", "ivan"),
+        )
+        self.assertIsNone(bot.parse_reservation_line("обычный текст без номера"))
+
+        # Sub-case A: Reserve spot 1 -> first real user gets 2
+        ok1, _ = bot.handle_reserve_command("1 Первый Бронь @first_vip", db_path=self.db_path)
+        self.assertTrue(ok1)
+        first_real = bot.handle_participation(6000, "Реальный", "ПослеПервого", "real_2", db_path=self.db_path)
+        self.assertEqual(first_real["number"], 2)
+        database.reset_contest(db_path=self.db_path)
+
+        # Sub-case B: Reserve spot 55 ("55 Иван Иванов @ivan"), register 54 real users (1..54),
+        # next real user must skip 55 and get 56!
+        ok55, _ = bot.handle_reserve_command("55 Иван Иванов @ivan", db_path=self.db_path)
+        self.assertTrue(ok55)
+
+        for i in range(1, 55):
+            r = bot.handle_participation(
+                user_id=6000 + i,
+                first_name=f"Участник_{i}",
+                last_name=None,
+                username=f"user_{i}",
+                db_path=self.db_path,
+            )
+            self.assertEqual(r["number"], i)
+
+        # 55th real participant clicks "Участвовать" -> skips reserved 55 and gets 56!
+        r_after_55 = bot.handle_participation(
+            user_id=6055,
+            first_name="УчастникПосле55",
+            last_name=None,
+            username="user_56",
+            db_path=self.db_path,
+        )
+        self.assertTrue(r_after_55["is_new"])
+        self.assertEqual(r_after_55["number"], 56)
+
+        # Trying to reserve spot #10 (already taken by a real participant) must be rejected
+        ok_taken, msg_taken = database.reserve_spot(10, "Занято", "taken", db_path=self.db_path)
+        self.assertFalse(ok_taken)
+        self.assertIn("уже занято реальным участником", msg_taken)
+
+        # Verify final list has 54, 55 (reserved), and 56 in exact sequential order
+        messages = bot.finish_contest_and_get_messages(db_path=self.db_path)
+        final_text = "\n".join(messages)
+        idx_54 = final_text.find("54. Участник_54 <tg-spoiler>@user_54</tg-spoiler>")
+        idx_55 = final_text.find("55. Иван Иванов <tg-spoiler>@ivan</tg-spoiler>")
+        idx_56 = final_text.find("56. УчастникПосле55 <tg-spoiler>@user_56</tg-spoiler>")
+        self.assertNotEqual(idx_54, -1)
+        self.assertNotEqual(idx_55, -1)
+        self.assertNotEqual(idx_56, -1)
+        self.assertLess(idx_54, idx_55)
+        self.assertLess(idx_55, idx_56)
+
+        # Non-admin trying /reserve or direct message "77 Хакер @hacker" is silently ignored
+        stranger_msg = MagicMock()
+        stranger_msg.from_user = MagicMock(id=7777, first_name="Stranger", last_name=None, username="stranger")
+        stranger_msg.text = "77 Хакер @hacker"
+        stranger_msg.answer = AsyncMock()
+
+        await bot.cmd_reserve(stranger_msg, command=None, db_path=self.db_path)
+        await bot.on_admin_direct_reservation_text(stranger_msg, db_path=self.db_path)
+        stranger_msg.answer.assert_not_awaited()
+        self.assertEqual([r["number"] for r in database.get_reserved_spots(db_path=self.db_path)], [55])
+
+        # Unreserving spot #55 works
+        ok_unres, _ = bot.handle_unreserve_command("/unreserve 55", db_path=self.db_path)
+        self.assertTrue(ok_unres)
+        self.assertEqual(database.get_reserved_spots(db_path=self.db_path), [])
+
+        # Resetting contest clears both participants and reserved spots
+        bot.handle_reserve_command("99 Тест Сброса @reset_test", db_path=self.db_path)
+        self.assertEqual(len(database.get_reserved_spots(db_path=self.db_path)), 1)
+        database.reset_contest(db_path=self.db_path)
+        self.assertEqual(database.get_reserved_spots(db_path=self.db_path), [])
+        self.assertEqual(database.get_participants_count(db_path=self.db_path), 0)
+
+    # -----------------------------------------------------------------------
+    # 8. Strict Single-Admin (ADMIN_USERNAME=wwtivan / ADMIN_ID) & Silent Ignore
     # -----------------------------------------------------------------------
     async def test_strict_single_admin_username_binding_and_silent_ignore(self) -> None:
         config.ADMIN_ID = None
@@ -289,7 +381,7 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(database.is_contest_active(db_path=self.db_path))
 
     # -----------------------------------------------------------------------
-    # 8. Aiogram Async Handlers Integration Test
+    # 9. Aiogram Async Handlers Integration Test
     # -----------------------------------------------------------------------
     async def test_aiogram_handlers_flow(self) -> None:
         # Owner @wwtivan (id=999) opens /start first, which auto-binds their ID 999
@@ -342,7 +434,7 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1. Сергей Тест <tg-spoiler>@sergey_t</tg-spoiler>", finish_reply)
 
     # -----------------------------------------------------------------------
-    # 9. Verify BOT_TOKEN & ADMIN_USERNAME against Config and Telegram getMe
+    # 10. Verify BOT_TOKEN & ADMIN_USERNAME against Config and Telegram getMe
     # -----------------------------------------------------------------------
     def test_bot_token_configured_and_valid_on_telegram(self) -> None:
         self.assertEqual(
