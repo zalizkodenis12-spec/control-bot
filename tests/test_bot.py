@@ -263,6 +263,9 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         first_real = bot.handle_participation(6000, "Реальный", "ПослеПервого", "real_2", db_path=self.db_path)
         self.assertEqual(first_real["number"], 2)
         database.reset_contest(db_path=self.db_path)
+        # Pre-reserved spots survive reset_contest() so admin can reserve before starting a new contest
+        self.assertEqual(len(database.get_reserved_spots(db_path=self.db_path)), 1)
+        database.clear_reserved_spots(db_path=self.db_path)
 
         # Sub-case B: Reserve spot 55 ("55 Иван Иванов @ivan"), register 54 real users (1..54),
         # next real user must skip 55 and get 56!
@@ -323,12 +326,14 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok_unres)
         self.assertEqual(database.get_reserved_spots(db_path=self.db_path), [])
 
-        # Resetting contest clears both participants and reserved spots
+        # Resetting contest clears real participants while preserving pre-reserved spots
         bot.handle_reserve_command("99 Тест Сброса @reset_test", db_path=self.db_path)
         self.assertEqual(len(database.get_reserved_spots(db_path=self.db_path)), 1)
         database.reset_contest(db_path=self.db_path)
+        self.assertEqual([r["number"] for r in database.get_reserved_spots(db_path=self.db_path)], [99])
+        self.assertEqual(database.get_participants_count(db_path=self.db_path, include_reserved=False), 0)
+        database.clear_reserved_spots(db_path=self.db_path)
         self.assertEqual(database.get_reserved_spots(db_path=self.db_path), [])
-        self.assertEqual(database.get_participants_count(db_path=self.db_path), 0)
 
     # -----------------------------------------------------------------------
     # 8. Strict Single-Admin (ADMIN_USERNAME=wwtivan / ADMIN_ID) & Silent Ignore

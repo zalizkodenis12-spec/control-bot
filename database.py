@@ -422,13 +422,12 @@ def get_participants_count(
 
 
 def reset_contest(db_path: str = DB_PATH) -> None:
-    """Clear all participants and reserved spots, and activate a new contest starting from number 1."""
+    """Clear all real participants and activate a new contest starting from number 1 (keeping pre-reserved spots)."""
     init_db(db_path)
     now_iso = datetime.now(timezone.utc).isoformat()
     with _db_lock, _get_connection(db_path) as conn:
         with conn:
             conn.execute("DELETE FROM participants")
-            conn.execute("DELETE FROM reserved_spots")
             conn.execute(
                 """
                 UPDATE contest_state
