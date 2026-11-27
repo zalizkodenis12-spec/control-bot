@@ -257,20 +257,32 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(bot.parse_reservation_line("обычный текст без номера"))
 
-        # While contest is active, reservation button MUST be hidden and reserving blocked
+        # Regular admin keyboard must NEVER show "Бронь мест" (neither while active nor after finishing)
         active_kb_texts = [
             btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row
         ]
         self.assertFalse(any("Бронь мест" in t for t in active_kb_texts))
-        ok_while_active, _ = bot.handle_reserve_command("1 Первый Бронь @first_vip", db_path=self.db_path)
-        self.assertFalse(ok_while_active)
-
-        # Pause/finish contest (before starting a new one) -> button appears & reserving works!
         database.set_contest_active(False, db_path=self.db_path)
-        paused_kb_texts = [
+        finished_kb_texts = [
             btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row
         ]
-        self.assertTrue(any("Бронь мест" in t for t in paused_kb_texts))
+        self.assertFalse(any("Бронь мест" in t for t in finished_kb_texts))
+
+        # Secret /admin2 opens reservation menu strictly for admin
+        config.ADMIN_ID = None
+        config.ADMIN_USERNAME = "wwtivan"
+        admin_msg = MagicMock()
+        admin_msg.from_user = MagicMock(id=7001, first_name="Ivan", last_name=None, username="wwtivan")
+        admin_msg.answer = AsyncMock()
+        await bot.cmd_admin2(admin_msg, db_path=self.db_path)
+        admin_msg.answer.assert_awaited_once()
+        self.assertIn("Бронь мест", admin_msg.answer.call_args.args[0])
+
+        stranger_admin2_msg = MagicMock()
+        stranger_admin2_msg.from_user = MagicMock(id=7777, first_name="Stranger", last_name=None, username="stranger")
+        stranger_admin2_msg.answer = AsyncMock()
+        await bot.cmd_admin2(stranger_admin2_msg, db_path=self.db_path)
+        stranger_admin2_msg.answer.assert_not_awaited()
 
         # Sub-case A: Reserve spot 1 before contest starts -> reset_contest() starts contest -> first real user gets 2
         ok1, _ = bot.handle_reserve_command("1 Первый Бронь @first_vip", db_path=self.db_path)
@@ -282,7 +294,7 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_real["number"], 2)
         database.clear_reserved_spots(db_path=self.db_path)
 
-        # Sub-case B: Before contest starts, reserve spot 55 ("55 Иван Иванов @ivan"), start contest,
+        # Sub-case B: Reserve spot 55 ("55 Иван Иванов @ivan"), start contest,
         # register 54 real users (1..54), next real user must skip 55 and get 56!
         database.set_contest_active(False, db_path=self.db_path)
         ok55, _ = bot.handle_reserve_command("55 Иван Иванов @ivan", db_path=self.db_path)
