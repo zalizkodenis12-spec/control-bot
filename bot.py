@@ -590,16 +590,11 @@ def get_admin_panel_text(db_path: str = DB_PATH) -> str:
     """Build the status overview text for the Author/Admin Panel."""
     active = database.is_contest_active(db_path=db_path)
     count = database.get_participants_count(db_path=db_path)
-    reserved_count = len(database.get_reserved_spots(db_path=db_path))
     status_str = "🟢 Активен (идёт набор участников)" if active else "🔴 Завершён"
-    reserved_line = (
-        f"📌 Забронировано мест: <b>{reserved_count}</b>\n" if reserved_count > 0 else ""
-    )
     return (
         "⚙️ <b>Панель управления конкурсом (Автор)</b>\n\n"
         f"📊 Статус конкурса: <b>{status_str}</b>\n"
-        f"👥 Всего участников в списке: <b>{count}</b>\n"
-        f"{reserved_line}\n"
+        f"👥 Зарегистрировано участников: <b>{count}</b>\n\n"
         "Выберите нужное действие кнопками ниже:"
     )
 
