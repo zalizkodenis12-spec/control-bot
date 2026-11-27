@@ -257,23 +257,29 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(bot.parse_reservation_line("обычный текст без номера"))
 
-        # Admin keyboard hides "Бронь мест" while contest is active, shows it before contest starts,
-        # and NEVER shows it under participant lists (include_reserve=False)
+        # Admin keyboard never shows "Бронь мест" button; reservation is under "📢 Пост для канала" (admin_post) and /admin2
         active_kb_texts = [
             btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row
         ]
         self.assertFalse(any("Бронь мест" in t for t in active_kb_texts))
+        self.assertTrue(any("Пост для канала" in t for t in active_kb_texts))
         database.set_contest_active(False, db_path=self.db_path)
         finished_kb_texts = [
             btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row
         ]
-        self.assertTrue(any("Бронь мест" in t for t in finished_kb_texts))
-        list_kb_texts = [
-            btn.text
-            for row in bot.get_admin_inline_keyboard(db_path=self.db_path, include_reserve=False).inline_keyboard
-            for btn in row
-        ]
-        self.assertFalse(any("Бронь мест" in t for t in list_kb_texts))
+        self.assertFalse(any("Бронь мест" in t for t in finished_kb_texts))
+
+        # Clicking "📢 Пост для канала" (admin_post) opens reservation menu strictly for admin
+        config.ADMIN_ID = None
+        config.ADMIN_USERNAME = "wwtivan"
+        post_cb = MagicMock()
+        post_cb.from_user = MagicMock(id=7001, first_name="Ivan", last_name=None, username="wwtivan")
+        post_cb.message = MagicMock()
+        post_cb.message.answer = AsyncMock()
+        post_cb.answer = AsyncMock()
+        await bot.on_admin_post_callback(post_cb, db_path=self.db_path)
+        post_cb.message.answer.assert_awaited_once()
+        self.assertIn("Бронирование мест", post_cb.message.answer.call_args.args[0])
 
         # Secret /admin2 opens reservation menu strictly for admin
         config.ADMIN_ID = None

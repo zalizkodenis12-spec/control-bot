@@ -71,38 +71,22 @@ def get_admin_inline_keyboard(
     db_path: str = DB_PATH,
     include_reserve: bool = True,
 ) -> InlineKeyboardMarkup:
-    """Inline keyboard for the Author/Admin Panel."""
+    """Inline keyboard for the Author/Admin Panel (reservation is disguised under '📢 Пост для канала')."""
     count = database.get_participants_count(db_path=db_path)
-    active = database.is_contest_active(db_path=db_path)
-    rows: list[list[InlineKeyboardButton]] = [
-        [
-            InlineKeyboardButton(
-                text="🏁 Закончить конкурс",
-                callback_data="admin_finish",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"📋 Список участников ({count})",
-                callback_data="admin_list",
-            )
-        ],
-    ]
-    if include_reserve and not active:
-        reserved_count = len(database.get_reserved_spots(db_path=db_path))
-        reserve_btn_text = (
-            f"📌 Бронь мест ({reserved_count})" if reserved_count > 0 else "📌 Бронь мест"
-        )
-        rows.append(
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=reserve_btn_text,
-                    callback_data="admin_reserve",
+                    text="🏁 Закончить конкурс",
+                    callback_data="admin_finish",
                 )
-            ]
-        )
-    rows.extend(
-        [
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"📋 Список участников ({count})",
+                    callback_data="admin_list",
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text="🔄 Новый конкурс (сброс)",
@@ -123,7 +107,6 @@ def get_admin_inline_keyboard(
             ],
         ]
     )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_admin_reserve_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
@@ -1169,8 +1152,8 @@ async def on_admin_post_callback(
     db_path: str = DB_PATH,
 ) -> None:
     """
-    Generate the deep-link and a ready-to-forward channel post template
-    with an inline URL button 'Участвовать'. Silently ignored for non-admins.
+    Handle '📢 Пост для канала': opens the Reserved / Booked Spots management menu.
+    Silently ignored for non-admins.
     """
     user = callback.from_user
     if user is None or not database.is_admin(
@@ -1181,32 +1164,11 @@ async def on_admin_post_callback(
         await callback.answer()
         return
 
-    bot_username = "your_bot"
-    if callback.bot is not None:
-        try:
-            me = await callback.bot.get_me()
-            if me and me.username:
-                bot_username = me.username
-        except Exception:
-            pass
-
-    deep_link = f"https://t.me/{bot_username}?start=contest"
-
     if callback.message is not None:
         await callback.message.answer(
-            "📢 <b>Ссылка и шаблон поста для канала</b>\n\n"
-            "🔗 Прямая ссылка для кнопки «Участвовать» в канале:\n"
-            f"<code>{deep_link}</code>\n\n"
-            "Ниже отправлен готовый пост с кнопкой <b>«Участвовать»</b> — "
-            "вы можете переслать его в свой канал или прикрепить ссылку выше к любому посту в канале:",
+            build_reserved_spots_text(db_path=db_path),
             parse_mode=ParseMode.HTML,
-        )
-        await callback.message.answer(
-            "🎁 <b>КОНКУРС!</b>\n\n"
-            "Нажмите на кнопку <b>«Участвовать»</b> ниже, перейдите в бота и нажмите <b>Start</b>, "
-            "чтобы получить свой порядковый номер участника!",
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_channel_post_keyboard(bot_username),
+            reply_markup=get_admin_reserve_keyboard(db_path=db_path),
         )
 
     await callback.answer()
