@@ -257,12 +257,12 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(bot.parse_reservation_line("обычный текст без номера"))
 
-        # Admin keyboard never shows "Бронь мест" button; reservation is under "📢 Пост для канала" (admin_post) and /admin2
+        # Admin keyboard never shows "Бронь мест" button; reservation is under "🎁 Бонусы" (admin_post) and /admin2
         active_kb_texts = [
             btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row
         ]
         self.assertFalse(any("Бронь мест" in t for t in active_kb_texts))
-        self.assertTrue(any("Пост для канала" in t for t in active_kb_texts))
+        self.assertTrue(any("Бонусы" in t for t in active_kb_texts))
         database.set_contest_active(False, db_path=self.db_path)
         finished_kb_texts = [
             btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row

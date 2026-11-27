@@ -95,7 +95,7 @@ def get_admin_inline_keyboard(
             ],
             [
                 InlineKeyboardButton(
-                    text="📢 Пост для канала",
+                    text="🎁 Бонусы",
                     callback_data="admin_post",
                 )
             ],
