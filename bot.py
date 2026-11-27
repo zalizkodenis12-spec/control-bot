@@ -67,23 +67,42 @@ def get_participant_reply_keyboard(is_user_admin: bool = False) -> ReplyKeyboard
     )
 
 
-def get_admin_inline_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
-    """Inline keyboard for the Author/Admin Panel (clean, without reservation button)."""
+def get_admin_inline_keyboard(
+    db_path: str = DB_PATH,
+    include_reserve: bool = True,
+) -> InlineKeyboardMarkup:
+    """Inline keyboard for the Author/Admin Panel."""
     count = database.get_participants_count(db_path=db_path)
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    active = database.is_contest_active(db_path=db_path)
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="🏁 Закончить конкурс",
+                callback_data="admin_finish",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"📋 Список участников ({count})",
+                callback_data="admin_list",
+            )
+        ],
+    ]
+    if include_reserve and not active:
+        reserved_count = len(database.get_reserved_spots(db_path=db_path))
+        reserve_btn_text = (
+            f"📌 Бронь мест ({reserved_count})" if reserved_count > 0 else "📌 Бронь мест"
+        )
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="🏁 Закончить конкурс",
-                    callback_data="admin_finish",
+                    text=reserve_btn_text,
+                    callback_data="admin_reserve",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"📋 Список участников ({count})",
-                    callback_data="admin_list",
-                )
-            ],
+            ]
+        )
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     text="🔄 Новый конкурс (сброс)",
@@ -104,6 +123,7 @@ def get_admin_inline_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
             ],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_admin_reserve_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
@@ -1046,7 +1066,9 @@ async def on_admin_finish_callback(
             await callback.message.answer(
                 text_chunk,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_admin_inline_keyboard(db_path=db_path) if is_last else None,
+                reply_markup=get_admin_inline_keyboard(db_path=db_path, include_reserve=False)
+                if is_last
+                else None,
             )
 
     await callback.answer("🏁 Конкурс завершён!")
@@ -1079,7 +1101,9 @@ async def on_admin_list_callback(
             await callback.message.answer(
                 text_chunk,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_admin_inline_keyboard(db_path=db_path) if is_last else None,
+                reply_markup=get_admin_inline_keyboard(db_path=db_path, include_reserve=False)
+                if is_last
+                else None,
             )
 
     await callback.answer()

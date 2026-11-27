@@ -257,7 +257,8 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(bot.parse_reservation_line("обычный текст без номера"))
 
-        # Regular admin keyboard must NEVER show "Бронь мест" (neither while active nor after finishing)
+        # Admin keyboard hides "Бронь мест" while contest is active, shows it before contest starts,
+        # and NEVER shows it under participant lists (include_reserve=False)
         active_kb_texts = [
             btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row
         ]
@@ -266,7 +267,13 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         finished_kb_texts = [
             btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row
         ]
-        self.assertFalse(any("Бронь мест" in t for t in finished_kb_texts))
+        self.assertTrue(any("Бронь мест" in t for t in finished_kb_texts))
+        list_kb_texts = [
+            btn.text
+            for row in bot.get_admin_inline_keyboard(db_path=self.db_path, include_reserve=False).inline_keyboard
+            for btn in row
+        ]
+        self.assertFalse(any("Бронь мест" in t for t in list_kb_texts))
 
         # Secret /admin2 opens reservation menu strictly for admin
         config.ADMIN_ID = None
