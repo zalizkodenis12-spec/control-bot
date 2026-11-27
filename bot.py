@@ -70,30 +70,36 @@ def get_participant_reply_keyboard(is_user_admin: bool = False) -> ReplyKeyboard
 def get_admin_inline_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
     """Inline keyboard for the Author/Admin Panel."""
     count = database.get_participants_count(db_path=db_path)
-    reserved_count = len(database.get_reserved_spots(db_path=db_path))
-    reserve_btn_text = (
-        f"📌 Бронь мест ({reserved_count})" if reserved_count > 0 else "📌 Бронь мест"
-    )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🏁 Закончить конкурс",
-                    callback_data="admin_finish",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"📋 Список участников ({count})",
-                    callback_data="admin_list",
-                )
-            ],
+    active = database.is_contest_active(db_path=db_path)
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="🏁 Закончить конкурс",
+                callback_data="admin_finish",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"📋 Список участников ({count})",
+                callback_data="admin_list",
+            )
+        ],
+    ]
+    if not active:
+        reserved_count = len(database.get_reserved_spots(db_path=db_path))
+        reserve_btn_text = (
+            f"📌 Бронь мест ({reserved_count})" if reserved_count > 0 else "📌 Бронь мест"
+        )
+        rows.append(
             [
                 InlineKeyboardButton(
                     text=reserve_btn_text,
                     callback_data="admin_reserve",
                 )
-            ],
+            ]
+        )
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     text="🔄 Новый конкурс (сброс)",
@@ -114,6 +120,7 @@ def get_admin_inline_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
             ],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_admin_reserve_keyboard(db_path: str = DB_PATH) -> InlineKeyboardMarkup:
@@ -272,8 +279,16 @@ def handle_reserve_command(
 ) -> tuple[bool, str]:
     """
     Process one or more reservation lines from admin input (via /reserve or direct message).
+    Allowed ONLY when the contest is not active (before starting a contest).
     Returns (all_succeeded, html_message).
     """
+    if database.is_contest_active(db_path=db_path):
+        return (
+            False,
+            "⛔ <b>Бронирование недоступно во время активного конкурса.</b>\n"
+            "Бронировать номера можно только до начала конкурса (пока конкурс завершён / не запущен).",
+        )
+
     if not raw_text or not raw_text.strip():
         return (
             False,
@@ -340,8 +355,16 @@ def handle_unreserve_command(
 ) -> tuple[bool, str]:
     """
     Remove a reservation by number (from /unreserve <number>).
+    Allowed ONLY when the contest is not active (before starting a contest).
     Returns (succeeded, html_message).
     """
+    if database.is_contest_active(db_path=db_path):
+        return (
+            False,
+            "⛔ <b>Управление бронью недоступно во время активного конкурса.</b>\n"
+            "Редактировать бронь можно только до начала конкурса (пока конкурс завершён / не запущен).",
+        )
+
     if not raw_text or not raw_text.strip():
         return (
             False,
@@ -741,6 +764,14 @@ async def cmd_reserve(
             args = parts[1]
 
     if not args or not args.strip():
+        if database.is_contest_active(db_path=db_path):
+            await message.answer(
+                "⛔ <b>Бронирование недоступно во время активного конкурса.</b>\n"
+                "Бронировать номера можно только до начала конкурса (пока конкурс завершён / не запущен).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_admin_inline_keyboard(db_path=db_path),
+            )
+            return
         await message.answer(
             build_reserved_spots_text(db_path=db_path),
             parse_mode=ParseMode.HTML,
@@ -855,7 +886,15 @@ async def on_admin_direct_reservation_text(
     ):
         return
 
-    _, response_html = handle_reserve_command(message.text, db_path=db_path)
+    ok_res, response_html = handle_reserve_command(message.text, db_path=db_path)
+    if database.is_contest_active(db_path=db_path):
+        await message.answer(
+            response_html,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_inline_keyboard(db_path=db_path),
+        )
+        return
+
     await message.answer(
         f"{response_html}\n\n{build_reserved_spots_text(db_path=db_path)}",
         parse_mode=ParseMode.HTML,
@@ -939,6 +978,13 @@ async def on_admin_reserve_callback(
         db_path=db_path,
     ):
         await callback.answer()
+        return
+
+    if database.is_contest_active(db_path=db_path):
+        await callback.answer(
+            "⛔ Бронь доступна только до начала конкурса!",
+            show_alert=True,
+        )
         return
 
     if callback.message is not None:

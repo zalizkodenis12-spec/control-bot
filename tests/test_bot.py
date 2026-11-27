@@ -257,20 +257,37 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(bot.parse_reservation_line("обычный текст без номера"))
 
-        # Sub-case A: Reserve spot 1 -> first real user gets 2
+        # While contest is active, reservation button MUST be hidden and reserving blocked
+        active_kb_texts = [
+            btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row
+        ]
+        self.assertFalse(any("Бронь мест" in t for t in active_kb_texts))
+        ok_while_active, _ = bot.handle_reserve_command("1 Первый Бронь @first_vip", db_path=self.db_path)
+        self.assertFalse(ok_while_active)
+
+        # Pause/finish contest (before starting a new one) -> button appears & reserving works!
+        database.set_contest_active(False, db_path=self.db_path)
+        paused_kb_texts = [
+            btn.text for row in bot.get_admin_inline_keyboard(db_path=self.db_path).inline_keyboard for btn in row
+        ]
+        self.assertTrue(any("Бронь мест" in t for t in paused_kb_texts))
+
+        # Sub-case A: Reserve spot 1 before contest starts -> reset_contest() starts contest -> first real user gets 2
         ok1, _ = bot.handle_reserve_command("1 Первый Бронь @first_vip", db_path=self.db_path)
         self.assertTrue(ok1)
-        first_real = bot.handle_participation(6000, "Реальный", "ПослеПервого", "real_2", db_path=self.db_path)
-        self.assertEqual(first_real["number"], 2)
         database.reset_contest(db_path=self.db_path)
         # Pre-reserved spots survive reset_contest() so admin can reserve before starting a new contest
         self.assertEqual(len(database.get_reserved_spots(db_path=self.db_path)), 1)
+        first_real = bot.handle_participation(6000, "Реальный", "ПослеПервого", "real_2", db_path=self.db_path)
+        self.assertEqual(first_real["number"], 2)
         database.clear_reserved_spots(db_path=self.db_path)
 
-        # Sub-case B: Reserve spot 55 ("55 Иван Иванов @ivan"), register 54 real users (1..54),
-        # next real user must skip 55 and get 56!
+        # Sub-case B: Before contest starts, reserve spot 55 ("55 Иван Иванов @ivan"), start contest,
+        # register 54 real users (1..54), next real user must skip 55 and get 56!
+        database.set_contest_active(False, db_path=self.db_path)
         ok55, _ = bot.handle_reserve_command("55 Иван Иванов @ivan", db_path=self.db_path)
         self.assertTrue(ok55)
+        database.reset_contest(db_path=self.db_path)
 
         for i in range(1, 55):
             r = bot.handle_participation(
