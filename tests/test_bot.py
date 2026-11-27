@@ -276,7 +276,7 @@ class TestContestBot(unittest.IsolatedAsyncioTestCase):
         admin_msg.answer = AsyncMock()
         await bot.cmd_admin2(admin_msg, db_path=self.db_path)
         admin_msg.answer.assert_awaited_once()
-        self.assertIn("Бронь мест", admin_msg.answer.call_args.args[0])
+        self.assertIn("Бронирование мест", admin_msg.answer.call_args.args[0])
 
         stranger_admin2_msg = MagicMock()
         stranger_admin2_msg.from_user = MagicMock(id=7777, first_name="Stranger", last_name=None, username="stranger")
